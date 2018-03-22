@@ -10,20 +10,24 @@ const git = require('git-rev');
 const gitTag = require('git-tag')({localOnly:true});
 const gitStatus = require("git-status");
 
-var pkg;
-
 // the "opts" object will contain all the command line parameters and options
 // So the first parameter will be in the opts._ array, eg the first one will be in opts._[0]
 // eg if run with --debug, then opts.debug will be true
 const opts = require('minimist')(process.argv.slice(2));
+// Be forgiving on this one
+if (opts['dry-run'])
+	opts.dry_run = true;
+const willDo = (opts.dry_run) ? '(Not) ' : '';
 
 if (opts.help) {
 	console.log(`
 #Usage:
-	npm run deploy-XXX -- [--help] [--minor|major] [--releases]
+	npm run deploy-XXX -- [--help] [--minor|major] [--all] [--dry_run]
 Where
 	--minor will bump the minor version, eg 1.2.5 => 1.3.0
 	--major will bump the major version, eg 1.2.5 => 2.0.0
+	--all will deploy to all hosts of the same level (eg prod)
+	--dry_run will go through the motions, but not actually execute any commands 
 
 NB: If you are specifying command line switches, you need to specify '--' in order for subsequent parameters to be passed through to the script
 ==  (otherwise command options are passsed to npm, which is not what you want)
@@ -45,7 +49,11 @@ function ABORT(msg) {
 	process.exit(1);
 }
 
-var tdir = "./templates";
+// 
+// Recurse through the templates directory and mailmerge them into the target app
+//   (you could template more than just the version no if you like)
+//
+const tdir = "./templates";
 try {
 	fs.existsSync(tdir);
 } catch (e) {
@@ -104,6 +112,14 @@ const choices = {
 	},
 };
 
+function doCmd(cmd) {
+	if (opts.debug)
+	  console.log(`${willDo}Executing command: ${cmd}`);
+	if (!opts.dry_run && exec(cmd).code !== 0) {
+	  ABORT('Error: command failed ('+cmd+')');
+	}
+};
+
 if (_.keys(choices).indexOf(opts._[0]) === -1) {
 	ABORT("Fatal error: You must specify one of "+_.keys(choices).join(", "));
 }
@@ -123,7 +139,7 @@ gitStatus((err, data) => {
   		dirty.push(row.to);
   	}
   });
-  if (dirty.length) {
+  if (dirty.length && !opts.dry_run) {
   	ABORT("Git is showing "+dirty.length+" dirty files, ("+dirty.join(", ")+") please fix and retry");
   }
   checkBranch();
@@ -132,23 +148,35 @@ gitStatus((err, data) => {
 function checkBranch() {
 	git.branch(function (str) {
 		pkg.branch = str;
-		if (choice.branch !== '' && pkg.branch !== choice.branch) {
-			ABORT("You need to be on the ["+choice.branch+"] branch to deploy to the '"+choice.name+"' server.");
+		if (choice.branch !== '' && pkg.branch !== choice.branch && !opts.dry_run) {
+			ABORT(`You need to be on the [${choice.branch}] branch to deploy to the '${choice.name}' server.`);
 		}
-		const newtag = pkg.branch+"-v"+pkg.version;
-		if (opts.debug)
-			console.log("Adding tag ["+newtag+"]");
-		pkg.tag = newtag;
-	//	gitTag.create(newtag, 'Tag message '+pkg.when, function(err, res){
-	//		if (err)
-	//			console.error(err);
-	//		console.log("Tag result:",res);
-	//	});
-		console.log("about to do templating");
-		bumpVersion();
+		pkg.tag = pkg.branch+"-v"+pkg.version;
+		npmInstall();
 	});
 }
 
+//
+// A bit of defensive code to do a `meteor npm install`, which helps to prevent deployment problems
+//   due to missing packages.
+//
+function npmInstall() {
+	if (opts.debug)
+		console.log(`Updating npm packages`);		
+	doCmd("cd app && meteor npm install && cd .. ");
+	gitStatus((err, data) => {
+	  const dirty = [];
+	  _.each(data,row => {
+	  	if (row.from || row.y === 'M') {
+	  		dirty.push(row.to);
+	  	}
+	  });
+	  if (dirty.length && !opts.dry_run) {
+			doCmd("git commit -am 'npm install' && git push");
+	  }
+		bumpVersion();
+	});
+}
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 //
 // The first job is to bump the version (sometimes)
@@ -166,11 +194,7 @@ function bumpVersion() {
 		}
 		const cmd = `cd ${choice.app} && npm version ${level} --no-git-tag-version -m "Deploying version to ${choice.name}] - - - - - - - -"`;
 		if (!opts.nobump) {
-			if (opts.debug)
-			  console.log("Executing command: "+cmd);
-			if (exec(cmd).code !== 0) {
-			  ABORT('Error: version bump command failed ('+cmd+')');
-			}
+			doCmd(cmd);
 		}
 	}
   doTemplating();
@@ -178,7 +202,7 @@ function bumpVersion() {
 //
 // Read the package file - specifically get the version
 //
-pkg = require(process.cwd()+`/${choice.app}/package.json`); // eslint-disable-line global-require
+const pkg = require(process.cwd()+`/${choice.app}/package.json`); // eslint-disable-line global-require
 pkg.when = new Date();
 git.long(function (str) {
 	pkg.commit = str;
@@ -188,32 +212,32 @@ git.long(function (str) {
 // We now do some templating of key config files
 //
 function doTemplating() {
-	var basedir = process.cwd()+`/${choice.app}/`;
+	const basedir = process.cwd()+`/${choice.app}/`;
 
-	if (opts.debug)
-		console.log("cwd="+process.cwd());
+	// if (opts.debug)
+	// 	console.log("cwd="+process.cwd());
 
 	recursive(tdir, [], function (err, files) {
 		if (err) {
-			console.log("Recursion error: ",err)
+			console.error("Recursion error: ",err)
 		}
 	  // Files is an array of filename
-		if (opts.debug)
-		  console.log(files);
+		// if (opts.debug)
+		//   console.log(files);
 		_.each(files,function(f) {
-			console.log("Templating file "+f);
-			var t = fs.readFileSync(f,'utf8');
+			const destf = f.replace("templates/",basedir);
+			console.info(`${willDo}Templating file ${f} => ${destf}`);
+			const t = fs.readFileSync(f,'utf8');
 			// if (opts.debug)
 			//   console.log("template=",t);
-			var tt = _.template(t);
-			var buf = tt(pkg);
-			var destf = f;
-			destf = destf.replace("templates/",basedir);
-			if (opts.debug)
-			  console.log("writing ",destf);
-			fs.writeFileSync(destf,buf);
+			const tt = _.template(t);
+			const buf = tt(pkg);
+			// if (opts.debug) {
+			//   console.log(`${willDo}writing ${destf}`);
+			// }
+			if (!opts.dry_run)
+				fs.writeFileSync(destf,buf);
 		});
-		console.log("Done templating");
 		mainGame();
 	});
 }
@@ -235,11 +259,24 @@ function mainGame() {
 	cmds.push("git push --tags");
 
   cmds.push("echo Deploying files to remote server");
-  var mupdir = "./deployment/"+choice.name+"/";
-  var settingsFile = mupdir+"settings.json";
-  var mupFile = mupdir+"mup.js";
-  cmds.push("mup deploy --settings "+settingsFile+" --config "+mupFile);
+  let mupdir = "./deployment/"+choice.name+"/";
+  const settingsFile = mupdir+"settings.json";
+  const mupFile = mupdir+"mup.js";
 
+  const cmd = "mup deploy --settings "+settingsFile+" --config "+ mupFile;
+  cmds.push(cmd);
+
+  if (opts.all) {
+	  Object.keys(choices)
+	  .filter(name => choices[name].branch === choice.branch && choices[name].name !== choice.name)
+	  .forEach(name => {
+			cmds.push(`echo Deploying cached build to ${name}`);
+		  mupdir = "./deployment/"+choices[name].name;
+		  const command = ` 	 mup deploy --settings ${mupdir}/settings.json --cached-build --config ${mupdir}/mup.js`;
+		  cmds.push(command);
+	  })
+
+  }
 	cmds.push("echo Done.");
 
 
@@ -248,10 +285,6 @@ function mainGame() {
 	// Run all the commands in sequence
 	//
 	_.each(cmds,(cmd) => {
-		if (opts.debug)
-			console.log("Executing command: "+cmd);
-		if (exec(cmd).code !== 0) {
-		  ABORT('Error: command failed ('+cmd+')');
-		}
+		doCmd(cmd);
 	});
 }
